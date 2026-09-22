@@ -50,10 +50,51 @@ jobs:
         make operator-sdk
         sudo cp bin/operator-sdk/*/operator-sdk /usr/local/bin/
 
-    - name: Disable host SysRq as a CI safety guard
+    - name: Protect host from SysRq reboot as a CI safety guard
       run: |
-        sudo sysctl -w kernel.sysrq=0
-        test "$(sysctl -n kernel.sysrq)" = "0"
+        # kernel.sysrq=0 only disables keyboard SysRq, NOT /proc/sysrq-trigger!
+        # Per kernel docs: "Invocation of any operation via /proc/sysrq-trigger
+        # is always allowed (by a user with admin privileges)."
+        # Make /proc/sysrq-trigger read-only to prevent privileged containers
+        # from triggering a host reboot via nsenter.
+
+        echo "=== Before protection ==="
+        ls -la /proc/sysrq-trigger
+        lsattr /proc/sysrq-trigger 2>/dev/null || echo "lsattr not supported on /proc"
+
+        echo ""
+        echo "=== Applying protection ==="
+        sudo chmod 000 /proc/sysrq-trigger
+        echo "Applied: chmod 000 /proc/sysrq-trigger"
+
+        if sudo chattr +i /proc/sysrq-trigger 2>/dev/null; then
+          echo "Applied: chattr +i /proc/sysrq-trigger (immutable flag)"
+        else
+          echo "Skipped: chattr +i (not supported on /proc filesystem)"
+        fi
+
+        echo ""
+        echo "=== After protection ==="
+        ls -la /proc/sysrq-trigger
+        lsattr /proc/sysrq-trigger 2>/dev/null || echo "lsattr not supported on /proc"
+
+        echo ""
+        echo "=== Testing protection (expecting Permission denied) ==="
+        if echo "test" > /proc/sysrq-trigger 2>&1; then
+          echo "ERROR: Write to /proc/sysrq-trigger succeeded - protection FAILED!"
+          exit 1
+        else
+          echo "✓ Write blocked successfully - protection is active"
+        fi
+
+        echo ""
+        echo "=== Testing with sudo (should also fail) ==="
+        if sudo bash -c 'echo "test" > /proc/sysrq-trigger' 2>&1; then
+          echo "ERROR: Sudo write to /proc/sysrq-trigger succeeded - protection FAILED!"
+          exit 1
+        else
+          echo "✓ Sudo write also blocked - protection is working correctly"
+        fi
 
     - name: Create Kind cluster with registry, OLM, and cert-manager
       run: |
