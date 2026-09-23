@@ -55,46 +55,97 @@ jobs:
         # kernel.sysrq=0 only disables keyboard SysRq, NOT /proc/sysrq-trigger!
         # Per kernel docs: "Invocation of any operation via /proc/sysrq-trigger
         # is always allowed (by a user with admin privileges)."
-        # Make /proc/sysrq-trigger read-only to prevent privileged containers
-        # from triggering a host reboot via nsenter.
+        # Bind mount /dev/null over /proc/sysrq-trigger so writes succeed but
+        # do nothing. This prevents privileged containers from triggering a
+        # host reboot via nsenter.
 
-        echo "=== Before protection ==="
-        ls -la /proc/sysrq-trigger
-        lsattr /proc/sysrq-trigger 2>/dev/null || echo "lsattr not supported on /proc"
-
+        echo "========================================="
+        echo "SysRq Protection Setup and Verification"
+        echo "========================================="
         echo ""
-        echo "=== Applying protection ==="
-        sudo chmod 000 /proc/sysrq-trigger
-        echo "Applied: chmod 000 /proc/sysrq-trigger"
 
-        if sudo chattr +i /proc/sysrq-trigger 2>/dev/null; then
-          echo "Applied: chattr +i /proc/sysrq-trigger (immutable flag)"
+        echo "=== 1. BEFORE PROTECTION ==="
+        ls -lah /proc/sysrq-trigger
+        file /proc/sysrq-trigger || true
+        echo ""
+
+        echo "=== 2. APPLYING BIND MOUNT PROTECTION ==="
+        if sudo mount --bind /dev/null /proc/sysrq-trigger; then
+          echo "✓ Successfully mounted /dev/null over /proc/sysrq-trigger"
         else
-          echo "Skipped: chattr +i (not supported on /proc filesystem)"
+          echo "✗ FAILED to mount /dev/null over /proc/sysrq-trigger"
+          exit 1
         fi
-
         echo ""
-        echo "=== After protection ==="
-        ls -la /proc/sysrq-trigger
-        lsattr /proc/sysrq-trigger 2>/dev/null || echo "lsattr not supported on /proc"
 
+        echo "=== 3. AFTER PROTECTION ==="
+        ls -lah /proc/sysrq-trigger
+        file /proc/sysrq-trigger || true
+        mount | grep sysrq-trigger && echo "✓ Bind mount visible in mount table" || echo "⚠ Bind mount not in mount table (may be normal)"
         echo ""
-        echo "=== Testing protection (expecting Permission denied) ==="
+
+        echo "=== 4. TEST: Direct write (should succeed, write to /dev/null) ==="
         if echo "test" > /proc/sysrq-trigger 2>&1; then
-          echo "ERROR: Write to /proc/sysrq-trigger succeeded - protection FAILED!"
-          exit 1
+          echo "✓ Direct write succeeded (harmless to /dev/null)"
         else
-          echo "✓ Write blocked successfully - protection is active"
+          echo "✗ Direct write failed - unexpected!"
+          exit 1
+        fi
+        echo ""
+
+        echo "=== 5. TEST: Sudo write (should succeed, write to /dev/null) ==="
+        if sudo bash -c 'echo "test" > /proc/sysrq-trigger' 2>&1; then
+          echo "✓ Sudo write succeeded (harmless to /dev/null)"
+        else
+          echo "✗ Sudo write failed - unexpected!"
+          exit 1
+        fi
+        echo ""
+
+        echo "=== 6. CRITICAL TEST: nsenter write (simulates SNR behavior) ==="
+        echo "This test uses the EXACT same nsenter command that SNR uses."
+        echo "If this writes to the real sysrq-trigger, the runner will reboot!"
+        echo ""
+
+        # Use the exact same nsenter command that SNR uses
+        # /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c "echo b > /proc/sysrq-trigger"
+        # But use a safe test string instead of 'b' for now
+
+        echo "Testing with: nsenter -m/proc/1/ns/mnt /bin/bash -c 'echo test > /proc/sysrq-trigger'"
+        if sudo /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c 'echo "test" > /proc/sysrq-trigger' 2>&1; then
+          echo "✓ nsenter write succeeded (harmless to /dev/null)"
+        else
+          echo "✗ nsenter write failed - protection may not work for SNR!"
+          echo ""
+          echo "This means when SNR uses nsenter, our bind mount is NOT visible."
+          echo "The GitHub runner WILL be rebooted when SNR triggers software reboot."
+          echo "STOPPING NOW to prevent runner reboot during tests."
+          exit 1
+        fi
+        echo ""
+
+        echo "=== 7. VERIFY: Check what nsenter sees ==="
+        echo "Checking /proc/sysrq-trigger from within PID 1's mount namespace:"
+        sudo /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c 'ls -lah /proc/sysrq-trigger; file /proc/sysrq-trigger 2>/dev/null || true'
+        echo ""
+
+        echo "=== 8. FINAL VERIFICATION ==="
+        if sudo /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c 'test -c /proc/sysrq-trigger' 2>&1; then
+          echo "✓✓✓ SUCCESS: /proc/sysrq-trigger is a character device (null device) even from nsenter"
+          echo "✓✓✓ SNR software reboot will be SAFE - writes will go to /dev/null"
+        else
+          echo "✗✗✗ FAILURE: /proc/sysrq-trigger is NOT a character device from nsenter"
+          echo "✗✗✗ The bind mount is NOT visible in PID 1's mount namespace"
+          echo "✗✗✗ SNR software reboot WILL REBOOT the GitHub runner"
+          echo ""
+          echo "ABORTING to prevent runner reboot during tests."
+          exit 1
         fi
 
         echo ""
-        echo "=== Testing with sudo (should also fail) ==="
-        if sudo bash -c 'echo "test" > /proc/sysrq-trigger' 2>&1; then
-          echo "ERROR: Sudo write to /proc/sysrq-trigger succeeded - protection FAILED!"
-          exit 1
-        else
-          echo "✓ Sudo write also blocked - protection is working correctly"
-        fi
+        echo "========================================="
+        echo "✓ Protection verified - proceeding with tests"
+        echo "========================================="
 
     - name: Create Kind cluster with registry, OLM, and cert-manager
       run: |
