@@ -5,7 +5,16 @@ on:
     branches: [main*, release-*]
   pull_request:
     branches: [main*, release-*]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable SSH debug session'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 jobs:
   kind-e2e:
@@ -50,102 +59,13 @@ jobs:
         make operator-sdk
         sudo cp bin/operator-sdk/*/operator-sdk /usr/local/bin/
 
-    - name: Protect host from SysRq reboot as a CI safety guard
+    - name: Disable host SysRq as a CI safety guard (defense in depth)
       run: |
-        # kernel.sysrq=0 only disables keyboard SysRq, NOT /proc/sysrq-trigger!
-        # Per kernel docs: "Invocation of any operation via /proc/sysrq-trigger
-        # is always allowed (by a user with admin privileges)."
-        # Bind mount /dev/null over /proc/sysrq-trigger so writes succeed but
-        # do nothing. This prevents privileged containers from triggering a
-        # host reboot via nsenter.
-
-        echo "========================================="
-        echo "SysRq Protection Setup and Verification"
-        echo "========================================="
-        echo ""
-
-        echo "=== 1. BEFORE PROTECTION ==="
-        ls -lah /proc/sysrq-trigger
-        file /proc/sysrq-trigger || true
-        echo ""
-
-        echo "=== 2. APPLYING BIND MOUNT PROTECTION ==="
-        if sudo mount --bind /dev/null /proc/sysrq-trigger; then
-          echo "✓ Successfully mounted /dev/null over /proc/sysrq-trigger"
-        else
-          echo "✗ FAILED to mount /dev/null over /proc/sysrq-trigger"
-          exit 1
-        fi
-        echo ""
-
-        echo "=== 3. AFTER PROTECTION ==="
-        ls -lah /proc/sysrq-trigger
-        file /proc/sysrq-trigger || true
-        mount | grep sysrq-trigger && echo "✓ Bind mount visible in mount table" || echo "⚠ Bind mount not in mount table (may be normal)"
-        echo ""
-
-        echo "=== 4. TEST: Direct write (should succeed, write to /dev/null) ==="
-        if echo "test" > /proc/sysrq-trigger 2>&1; then
-          echo "✓ Direct write succeeded (harmless to /dev/null)"
-        else
-          echo "✗ Direct write failed - unexpected!"
-          exit 1
-        fi
-        echo ""
-
-        echo "=== 5. TEST: Sudo write (should succeed, write to /dev/null) ==="
-        if sudo bash -c 'echo "test" > /proc/sysrq-trigger' 2>&1; then
-          echo "✓ Sudo write succeeded (harmless to /dev/null)"
-        else
-          echo "✗ Sudo write failed - unexpected!"
-          exit 1
-        fi
-        echo ""
-
-        echo "=== 6. CRITICAL TEST: nsenter write (simulates SNR behavior) ==="
-        echo "This test uses the EXACT same nsenter command that SNR uses."
-        echo "If this writes to the real sysrq-trigger, the runner will reboot!"
-        echo ""
-
-        # Use the exact same nsenter command that SNR uses
-        # /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c "echo b > /proc/sysrq-trigger"
-        # But use a safe test string instead of 'b' for now
-
-        echo "Testing with: nsenter -m/proc/1/ns/mnt /bin/bash -c 'echo test > /proc/sysrq-trigger'"
-        if sudo /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c 'echo "test" > /proc/sysrq-trigger' 2>&1; then
-          echo "✓ nsenter write succeeded (harmless to /dev/null)"
-        else
-          echo "✗ nsenter write failed - protection may not work for SNR!"
-          echo ""
-          echo "This means when SNR uses nsenter, our bind mount is NOT visible."
-          echo "The GitHub runner WILL be rebooted when SNR triggers software reboot."
-          echo "STOPPING NOW to prevent runner reboot during tests."
-          exit 1
-        fi
-        echo ""
-
-        echo "=== 7. VERIFY: Check what nsenter sees ==="
-        echo "Checking /proc/sysrq-trigger from within PID 1's mount namespace:"
-        sudo /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c 'ls -lah /proc/sysrq-trigger; file /proc/sysrq-trigger 2>/dev/null || true'
-        echo ""
-
-        echo "=== 8. FINAL VERIFICATION ==="
-        if sudo /usr/bin/nsenter -m/proc/1/ns/mnt /bin/bash -c 'test -c /proc/sysrq-trigger' 2>&1; then
-          echo "✓✓✓ SUCCESS: /proc/sysrq-trigger is a character device (null device) even from nsenter"
-          echo "✓✓✓ SNR software reboot will be SAFE - writes will go to /dev/null"
-        else
-          echo "✗✗✗ FAILURE: /proc/sysrq-trigger is NOT a character device from nsenter"
-          echo "✗✗✗ The bind mount is NOT visible in PID 1's mount namespace"
-          echo "✗✗✗ SNR software reboot WILL REBOOT the GitHub runner"
-          echo ""
-          echo "ABORTING to prevent runner reboot during tests."
-          exit 1
-        fi
-
-        echo ""
-        echo "========================================="
-        echo "✓ Protection verified - proceeding with tests"
-        echo "========================================="
+        # Disable SysRq via sysctl. Note: This only disables keyboard SysRq,
+        # NOT /proc/sysrq-trigger writes, but we include it as defense in depth.
+        # The real protection is disabling SNR software reboot below.
+        sudo sysctl -w kernel.sysrq=0
+        echo "✓ Disabled keyboard SysRq (defense in depth)"
 
     - name: Create Kind cluster with registry, OLM, and cert-manager
       run: |
@@ -195,22 +115,21 @@ jobs:
           --serviceaccount=${DEPLOY_NHC_NAMESPACE}:node-healthcheck-controller-manager \
           2>/dev/null || true
 
-    - name: Use SNR software reboot for Kind
+    - name: Disable SNR software reboot for Kind
       run: |
         kubectl -n ${DEPLOY_SNR_NAMESPACE} wait --for=create \
           selfnoderemediationconfig/self-node-remediation-config --timeout=120s
-        # Kind workers share the host kernel, so /dev/watchdog would be one
-        # softdog device shared by every SNR agent. Use a non-watchdog device
-        # so the agents exercise their software-reboot fallback instead.
-        # The host SysRq is disabled (kernel.sysrq=0) to prevent the software
-        # reboot from affecting the GitHub runner.
+        # Disable software reboot to prevent SNR from executing sysrq-trigger
+        # commands that could reboot the GitHub runner host. The kubelet-based
+        # reboot watcher will simulate reboots by restarting Kind containers
+        # when kubelet stops.
         kubectl -n ${DEPLOY_SNR_NAMESPACE} patch selfnoderemediationconfig \
           self-node-remediation-config --type=merge \
-          -p '{"spec":{"isSoftwareRebootEnabled":true,"watchdogFilePath":"/dev/null"}}'
+          -p '{"spec":{"isSoftwareRebootEnabled":false}}'
         kubectl -n ${DEPLOY_SNR_NAMESPACE} wait --for=create \
           daemonset/self-node-remediation-ds --timeout=120s
         kubectl -n ${DEPLOY_SNR_NAMESPACE} wait \
-          --for=jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="IS_SOFTWARE_REBOOT_ENABLED")].value}'=true \
+          --for=jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="IS_SOFTWARE_REBOOT_ENABLED")].value}'=false \
           daemonset/self-node-remediation-ds --timeout=120s
         kubectl -n ${DEPLOY_SNR_NAMESPACE} rollout status \
           daemonset/self-node-remediation-ds --timeout=120s
@@ -270,16 +189,44 @@ jobs:
         echo "=== ClusterRoleBindings for NHC ==="
         kubectl get clusterrolebindings -o wide 2>/dev/null | grep -i 'healthcheck\|nhc' || echo "None"
 
-    - name: Start Kind reboot watcher
+    - name: Start Kind reboot watcher (kubelet-based)
       run: |
         mkdir -p "${RUNNER_TEMP}/snr"
-        CONTAINER_TOOL=docker \
-        MEDIK8S_CLUSTER_NAME="${MEDIK8S_CLUSTER_NAME}" \
-        DEPLOY_SNR_NAMESPACE="${DEPLOY_SNR_NAMESPACE}" \
-        MEDIK8S_REBOOT_DELAY="${MEDIK8S_REBOOT_DELAY}" \
-          ./hack/kind-reboot-watcher.sh --name "${MEDIK8S_CLUSTER_NAME}" \
-          > "${RUNNER_TEMP}/snr/kind-reboot-watcher.log" 2>&1 &
+        # Use the shared tools kubelet-based watcher. This watches for kubelet
+        # stopping (triggered by SNR stopping the kubelet service) and restarts
+        # the Kind container. This approach matches NHC's workflow and doesn't
+        # rely on SNR software reboot working.
+        make dev-reboot-watcher > "${RUNNER_TEMP}/snr/kind-reboot-watcher.log" 2>&1 &
         echo $! > "${RUNNER_TEMP}/snr/kind-reboot-watcher.pid"
+        echo "Started kubelet-based reboot watcher (PID: $(cat ${RUNNER_TEMP}/snr/kind-reboot-watcher.pid))"
+
+    - name: Start SNR CR monitor (background logging)
+      run: |
+        mkdir -p "${RUNNER_TEMP}/snr"
+        # Monitor SelfNodeRemediation CRs during tests and log their lifecycle
+        (
+          echo "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) [SNR-MONITOR] Starting SNR CR monitor..."
+          while true; do
+            # Get all SNR CRs with their status
+            snrs=$(kubectl get selfnoderemediations -A -o json 2>/dev/null || echo '{"items":[]}')
+            count=$(echo "$snrs" | jq -r '.items | length')
+
+            # Only log when we find CRs (reduce noise)
+            if [ "$count" -gt 0 ]; then
+              echo "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) [SNR-MONITOR] Found $count SNR CR(s):"
+              echo "$snrs" | jq -r '.items[] |
+                "  - \(.metadata.namespace)/\(.metadata.name):" +
+                " phase=\(.status.phase // "none")" +
+                " nodeState=\(.status.nodeBackup.state // "none")" +
+                " timeAssumedRebooted=\(.status.timeAssumedRebooted // "none")"'
+            fi
+
+            sleep 30
+          done
+        ) > "${RUNNER_TEMP}/snr/snr-monitor.log" 2>&1 &
+        echo $! > "${RUNNER_TEMP}/snr/snr-monitor.pid"
+        echo "Started SNR CR monitor (PID: $(cat ${RUNNER_TEMP}/snr/snr-monitor.pid))"
+        echo "Monitor output: ${RUNNER_TEMP}/snr/snr-monitor.log"
 
     - name: Run e2e tests
       timeout-minutes: 70
@@ -289,13 +236,32 @@ jobs:
         LABEL_FILTER="!OCP-ONLY" \
         make e2e-test
 
-    - name: Stop Kind reboot watcher
+    - name: Stop background watchers
       if: ${{ always() }}
       run: |
+        # Stop Kind reboot watcher
         if [ -f "${RUNNER_TEMP}/snr/kind-reboot-watcher.pid" ]; then
           watcher_pid=$(cat "${RUNNER_TEMP}/snr/kind-reboot-watcher.pid")
           kill "${watcher_pid}" 2>/dev/null || true
           wait "${watcher_pid}" 2>/dev/null || true
+          echo "✓ Stopped reboot watcher"
+        fi
+
+        # Stop SNR CR monitor
+        if [ -f "${RUNNER_TEMP}/snr/snr-monitor.pid" ]; then
+          monitor_pid=$(cat "${RUNNER_TEMP}/snr/snr-monitor.pid")
+          kill "${monitor_pid}" 2>/dev/null || true
+          wait "${monitor_pid}" 2>/dev/null || true
+          echo "✓ Stopped SNR monitor"
+        fi
+
+        # Show SNR monitor output
+        echo ""
+        echo "=== SNR CR Monitor Log ==="
+        if [ -f "${RUNNER_TEMP}/snr/snr-monitor.log" ]; then
+          cat "${RUNNER_TEMP}/snr/snr-monitor.log"
+        else
+          echo "No monitor log found"
         fi
 
     - name: Debug on failure
