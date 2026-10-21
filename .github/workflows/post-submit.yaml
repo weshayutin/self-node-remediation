@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   push_to_registry:
-    name: Build and push unversioned images to quay.io/medik8s
+    name: Build and push the unversioned controller image to quay.io/medik8s
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
@@ -30,8 +30,8 @@ jobs:
           password: ${{ secrets.QUAY_PASSWORD }}
           registry: quay.io
 
-      - name: Build and push the committed operator version with latest images
-        # Keep the real CSV version; only the container tags use latest.
+      - name: Build and push the controller image
+        # This repository ships only the controller container; WAO owns the packaging.
         run: >-
-          make container-build-community container-push
+          make container-build container-push
           IMAGE_TAG=latest CONTAINER_TOOL=docker
