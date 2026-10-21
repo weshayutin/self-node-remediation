@@ -63,7 +63,7 @@ jobs:
             ## Release Artifacts
 
             ### Images
-            * Controller: quay.io/medik8s/self-node-remediation-operator:v${{ inputs.version }}
+            * Controller: quay.io/medik8s/self-node-remediation-controller:v${{ inputs.version }}
 
             This release does not publish an OLM bundle or catalog. The controller is deployed by
             the Workload Availability Operator, which owns the packaging and the RBAC.

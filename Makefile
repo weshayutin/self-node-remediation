@@ -45,8 +45,11 @@ IMAGE_TAG_BASE ?= $(IMAGE_REGISTRY)/$(OPERATOR_NAME)
 IMAGE_TAG = v$(VERSION)
 export IMAGE_TAG
 
-# Image URL to use all building/pushing image targets
-export IMG ?= $(IMAGE_TAG_BASE)-operator:$(IMAGE_TAG)
+# Image URL to use all building/pushing image targets.
+# Deliberately NOT <name>-operator: that image is the standalone OLM operator built from main.
+# This branch publishes a controller container that WAO deploys, so it gets its own repository and
+# the two can never overwrite each other.
+export IMG ?= $(IMAGE_TAG_BASE)-controller:$(IMAGE_TAG)
 
 .PHONY: print-image-tag
 print-image-tag: ## Print the current image tag (used by CI to know what was just built)

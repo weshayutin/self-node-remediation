@@ -30,6 +30,18 @@ controller as one of its operands. SNR is no longer installed as a standalone op
 What this branch removed: `bundle/`, `bundle.Dockerfile`, `config/manifests/` (CSV base),
 `config/scorecard/`, and every `bundle-*`, `catalog-*`, `operator-sdk` and `opm` Make target.
 
+### Image name
+
+This branch publishes **`quay.io/medik8s/self-node-remediation-controller`**, not
+`self-node-remediation-operator`. The `-operator` image is the standalone OLM operator built from
+`main`; keeping a separate repository means the two builds can never overwrite each other while
+both exist.
+
+SNR needs only this one image. The same binary is both the manager (`--is-manager`, run as a
+Deployment) and the per-node agent (run as a DaemonSet that the config controller renders at
+runtime from `install/`, using the image in `SELF_NODE_REMEDIATION_IMAGE`). It is built on
+`ubi-minimal` rather than distroless because the agent needs `nsenter` to reboot the node.
+
 What it keeps, and why:
 
 | Path | Why WAO needs it |
@@ -43,9 +55,13 @@ What it keeps, and why:
 ### Build and deploy
 
 ```sh
-make docker-build docker-push IMG=<registry>/self-node-remediation-operator:<tag>
-make deploy IMG=<registry>/self-node-remediation-operator:<tag>   # plain kustomize, no OLM
+# Builds quay.io/medik8s/self-node-remediation-controller:v<VERSION> by default.
+make docker-build docker-push
+make deploy      # plain kustomize, no OLM
 make undeploy
+
+# or point it somewhere else
+make docker-build docker-push IMG=<registry>/self-node-remediation-controller:<tag>
 ```
 
 ### Known gaps on this branch
